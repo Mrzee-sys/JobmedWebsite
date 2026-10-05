@@ -1,0 +1,19 @@
+{
+  "name": "jobmedwebsite-server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cloudinary": "^1.41.3",
+    "cors": "^2.8.5",
+    "dotenv": "^18.0.4",
+    "express": "^4.19.2",
+    "mongoose": "^9.10.3",
+    "multer": "^2.4.0",
+    "multer-storage-cloudinary": "^4.0.0"
+  }
+}
