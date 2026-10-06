@@ -18,6 +18,11 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '100kb' }));
 
+// Health check / heartbeat target (no DB work, responds instantly)
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', uptime: Math.round(process.uptime()) });
+});
+
 // MongoDB Connection
 const connectDB = async () => {
   try {
@@ -379,5 +384,32 @@ app.use((err, req, res, next) => {
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
   console.log(`Jobmed admin API listening on http://localhost:${PORT}`);
+  startKeepAlive();
 });
+
+/**
+ * Keep-alive heartbeat.
+ * Render's free tier spins the service down after 15 min of inactivity, which
+ * causes a slow cold start (and missing images) for the next visitor.
+ * Pinging our own public URL every 10 min keeps the instance warm.
+ * RENDER_EXTERNAL_URL is injected automatically by Render, so this is a no-op locally.
+ */
+function startKeepAlive() {
+  const baseUrl = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL;
+  if (!baseUrl) return;
+
+  const INTERVAL_MS = 10 * 60 * 1000;
+  const healthUrl = `${baseUrl.replace(/\/$/, '')}/api/health`;
+
+  setInterval(async () => {
+    try {
+      const res = await fetch(healthUrl);
+      console.log(`[keep-alive] ${res.status} ${new Date().toISOString()}`);
+    } catch (error) {
+      console.error('[keep-alive] ping failed:', error.message);
+    }
+  }, INTERVAL_MS);
+
+  console.log(`[keep-alive] pinging ${healthUrl} every ${INTERVAL_MS / 60000} min`);
+}
 
