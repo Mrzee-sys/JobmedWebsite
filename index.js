@@ -5,6 +5,12 @@ import multer from 'multer';
 import mongoose from 'mongoose';
 import { v2 as cloudinary } from 'cloudinary';
 import { CloudinaryStorage } from 'multer-storage-cloudinary';
+import bcrypt from 'bcryptjs';
+import jwt from 'jsonwebtoken';
+import crypto from 'node:crypto';
+import User from './models/User.js';
+import Booking, { BOOKING_SERVICES } from './models/Booking.js';
+import { sendVerificationCode } from './mailer.js';
 
 // Import our MongoDB Model
 import Hero from './models/Hero.js';
@@ -21,6 +27,148 @@ app.use(express.json({ limit: '100kb' }));
 // Health check / heartbeat target (no DB work, responds instantly)
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok', uptime: Math.round(process.uptime()) });
+});
+
+// ---------- Auth (only @jobmed.co.za emails) ----------
+const ALLOWED_DOMAIN = '@jobmed.co.za';
+const JWT_SECRET = process.env.JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('JWT_SECRET is not set in the server environment.');
+  process.exit(1);
+}
+
+const normalizeEmail = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : '');
+const isAllowedEmail = (email) =>
+  /^[^\s@]+@[^\s@]+$/.test(email) && email.endsWith(ALLOWED_DOMAIN) && email.indexOf('@') === email.length - ALLOWED_DOMAIN.length;
+const signToken = (user) => jwt.sign({ sub: user._id, email: user.email }, JWT_SECRET, { expiresIn: '8h' });
+
+app.post('/api/auth/register', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!isAllowedEmail(email)) {
+    return res.status(400).json({ error: `Only ${ALLOWED_DOMAIN} email addresses are allowed` });
+  }
+  if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
+    return res.status(400).json({ error: 'Password must be 8-128 characters' });
+  }
+  try {
+    const existing = await User.findOne({ email });
+    if (existing?.verified) {
+      return res.status(409).json({ error: 'An account with this email already exists' });
+    }
+    // Re-registering an unverified address replaces the pending account.
+    const user = existing || new User({ email });
+    user.passwordHash = await bcrypt.hash(password, 12);
+    await issueCode(user);
+    res.status(201).json({ pendingVerification: true, email });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to register' });
+  }
+});
+
+const CODE_TTL_MS = 15 * 60 * 1000;
+const MAX_CODE_ATTEMPTS = 5;
+const hashCode = (code) => crypto.createHmac('sha256', JWT_SECRET).update(code).digest('hex');
+
+async function issueCode(user) {
+  const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+  user.codeHash = hashCode(code);
+  user.codeExpires = new Date(Date.now() + CODE_TTL_MS);
+  user.codeAttempts = 0;
+  await user.save();
+  await sendVerificationCode(user.email, code);
+}
+
+app.post('/api/auth/verify', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const code = typeof req.body.code === 'string' ? req.body.code.trim() : '';
+  if (!isAllowedEmail(email) || !/^\d{6}$/.test(code)) {
+    return res.status(400).json({ error: 'Invalid email or code' });
+  }
+  try {
+    const user = await User.findOne({ email });
+    if (!user || user.verified || !user.codeHash || !user.codeExpires || user.codeExpires < new Date()) {
+      return res.status(400).json({ error: 'Code expired or invalid. Request a new code.' });
+    }
+    if (user.codeAttempts >= MAX_CODE_ATTEMPTS) {
+      return res.status(429).json({ error: 'Too many attempts. Request a new code.' });
+    }
+    const expected = Buffer.from(user.codeHash);
+    const actual = Buffer.from(hashCode(code));
+    if (!crypto.timingSafeEqual(expected, actual)) {
+      user.codeAttempts += 1;
+      await user.save();
+      return res.status(400).json({ error: 'Incorrect code' });
+    }
+    user.verified = true;
+    user.codeHash = '';
+    user.codeExpires = undefined;
+    await user.save();
+    res.json({ token: signToken(user), email: user.email });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to verify' });
+  }
+});
+
+app.post('/api/auth/resend', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  if (!isAllowedEmail(email)) return res.status(400).json({ error: 'Invalid email' });
+  try {
+    const user = await User.findOne({ email });
+    const cooledDown = user?.codeExpires && user.codeExpires.getTime() - Date.now() > CODE_TTL_MS - 30000;
+    if (user && !user.verified && !cooledDown) await issueCode(user);
+    // Same response either way so accounts can't be enumerated.
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to resend code' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const email = normalizeEmail(req.body.email);
+  const { password } = req.body;
+  if (!isAllowedEmail(email)) {
+    return res.status(403).json({ error: `Only ${ALLOWED_DOMAIN} email addresses are allowed` });
+  }
+  try {
+    const user = typeof password === 'string' ? await User.findOne({ email }) : null;
+    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+    if (!user.verified) {
+      return res.status(403).json({ error: 'Email not verified', unverified: true });
+    }
+    res.json({ token: signToken(user), email: user.email });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to log in' });
+  }
+});
+
+function verifyBearer(req) {
+  const header = req.headers.authorization || '';
+  if (!header.startsWith('Bearer ')) return null;
+  try {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET);
+    return isAllowedEmail(payload.email) ? payload : null;
+  } catch {
+    return null;
+  }
+}
+
+app.get('/api/auth/me', (req, res) => {
+  const payload = verifyBearer(req);
+  if (!payload) return res.status(401).json({ error: 'Unauthorized' });
+  res.json({ email: payload.email });
+});
+
+// Public booking form submissions are the only non-GET call that needs no token.
+const isPublicBooking = (req) => req.method === 'POST' && req.path === '/bookings';
+
+// All non-GET API calls (content edits, uploads) require a valid admin token.
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET' || req.method === 'OPTIONS' || req.path.startsWith('/auth/') || isPublicBooking(req)) return next();
+  if (!verifyBearer(req)) return res.status(401).json({ error: 'Login required' });
+  next();
 });
 
 // MongoDB Connection
@@ -371,6 +519,32 @@ app.delete('/api/services-page/card-icon/:index', async (req, res) => {
     res.json(page);
   } catch (err) {
     res.status(500).json({ error: 'Failed to remove card icon' });
+  }
+});
+
+app.post('/api/bookings', async (req, res) => {
+  const { fullName, email, serviceRequested, companyName, message = '' } = req.body;
+  const normalizedEmail = normalizeEmail(email);
+
+  if (!isValidText(fullName) || !isValidText(companyName)) {
+    return res.status(400).json({ error: 'Full name and company name are required' });
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail) || normalizedEmail.length > 254) {
+    return res.status(400).json({ error: 'A valid email address is required' });
+  }
+  if (!BOOKING_SERVICES.includes(serviceRequested)) {
+    return res.status(400).json({ error: 'Please select a valid service' });
+  }
+  if (typeof message !== 'string' || message.length > 2000) {
+    return res.status(400).json({ error: 'Message must be text (max 2000 characters)' });
+  }
+
+  try {
+    const booking = new Booking({ fullName, email: normalizedEmail, serviceRequested, companyName, message });
+    await booking.save();
+    res.status(201).json({ success: true, id: booking._id });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to save booking' });
   }
 });
 
