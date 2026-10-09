@@ -31,6 +31,8 @@ app.get('/api/health', (req, res) => {
 
 // ---------- Auth (only @jobmed.co.za emails) ----------
 const ALLOWED_DOMAIN = '@jobmed.co.za';
+const ALLOWED_EXTRA_EMAILS = new Set(['shaunzurcher@gmail.com']);
+const ALLOWED_MESSAGE = `Only ${ALLOWED_DOMAIN} email addresses are allowed`;
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) {
   console.error('JWT_SECRET is not set in the server environment.');
@@ -39,14 +41,15 @@ if (!JWT_SECRET) {
 
 const normalizeEmail = (v) => (typeof v === 'string' ? v.trim().toLowerCase() : '');
 const isAllowedEmail = (email) =>
-  /^[^\s@]+@[^\s@]+$/.test(email) && email.endsWith(ALLOWED_DOMAIN) && email.indexOf('@') === email.length - ALLOWED_DOMAIN.length;
+  ALLOWED_EXTRA_EMAILS.has(email) ||
+  (/^[^\s@]+@[^\s@]+$/.test(email) && email.endsWith(ALLOWED_DOMAIN) && email.indexOf('@') === email.length - ALLOWED_DOMAIN.length);
 const signToken = (user) => jwt.sign({ sub: user._id, email: user.email }, JWT_SECRET, { expiresIn: '8h' });
 
 app.post('/api/auth/register', async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const { password } = req.body;
   if (!isAllowedEmail(email)) {
-    return res.status(400).json({ error: `Only ${ALLOWED_DOMAIN} email addresses are allowed` });
+    return res.status(400).json({ error: ALLOWED_MESSAGE });
   }
   if (typeof password !== 'string' || password.length < 8 || password.length > 128) {
     return res.status(400).json({ error: 'Password must be 8-128 characters' });
@@ -128,7 +131,7 @@ app.post('/api/auth/login', async (req, res) => {
   const email = normalizeEmail(req.body.email);
   const { password } = req.body;
   if (!isAllowedEmail(email)) {
-    return res.status(403).json({ error: `Only ${ALLOWED_DOMAIN} email addresses are allowed` });
+    return res.status(403).json({ error: ALLOWED_MESSAGE });
   }
   try {
     const user = typeof password === 'string' ? await User.findOne({ email }) : null;
